@@ -27,9 +27,22 @@ def _response(status, body):
 
 def _body(event):
     try:
-        return json.loads(event.get("body") or "{}")
+        body = json.loads(event.get("body") or "{}")
     except (TypeError, json.JSONDecodeError):
         raise ValueError("Request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise ValueError("Request body must be a JSON object")
+    return body
+
+
+def _scan_all(table, **kwargs):
+    rows = []
+    result = table.scan(**kwargs)
+    rows.extend(result.get("Items", []))
+    while result.get("LastEvaluatedKey"):
+        result = table.scan(ExclusiveStartKey=result["LastEvaluatedKey"], **kwargs)
+        rows.extend(result.get("Items", []))
+    return rows
 
 
 def create_product(event, context):
@@ -39,14 +52,23 @@ def create_product(event, context):
         missing = [key for key in required if item.get(key) in (None, "")]
         if missing:
             return _response(400, {"error": "Missing required fields", "fields": missing})
+        if not isinstance(item["name"], str) or not item["name"].strip():
+            return _response(400, {"error": "name must be a non-empty string"})
+        if not isinstance(item["searchQuery"], str) or not item["searchQuery"].strip():
+            return _response(400, {"error": "searchQuery must be a non-empty string"})
+        if not isinstance(item["vendorEmail"], str) or "@" not in item["vendorEmail"] or any(ch.isspace() for ch in item["vendorEmail"]):
+            return _response(400, {"error": "vendorEmail must be a valid email address"})
+        if "active" in item and not isinstance(item["active"], bool):
+            return _response(400, {"error": "active must be true or false"})
         current = Decimal(str(item["currentPrice"]))
         minimum = Decimal(str(item["minimumPrice"]))
         undercut = Decimal(str(item.get("undercutPercent", 5)))
-        if current <= 0 or minimum <= 0 or minimum > current or undercut < 0 or undercut > 100:
+        if (not current.is_finite() or not minimum.is_finite() or not undercut.is_finite()
+                or current <= 0 or minimum <= 0 or minimum > current or undercut < 0 or undercut > 100):
             return _response(400, {"error": "Prices must be positive, minimumPrice <= currentPrice, and undercutPercent between 0 and 100"})
         product = {
-            "productId": item.get("productId") or str(uuid4()),
-            "name": str(item["name"]), "searchQuery": str(item["searchQuery"]),
+            "productId": str(item.get("productId") or uuid4()),
+            "name": item["name"].strip(), "searchQuery": item["searchQuery"].strip(),
             "marketplace": item.get("marketplace", "EBAY_US"),
             "currency": item.get("currency", "USD"), "currentPrice": current,
             "minimumPrice": minimum, "undercutPercent": undercut,
@@ -61,6 +83,8 @@ def create_product(event, context):
             return _response(409, {"error": "productId already exists"})
         print(f"create_product failed: {exc}")
         return _response(500, {"error": "Unable to save product"})
+    except ValueError as exc:
+        return _response(400, {"error": str(exc)})
     except Exception as exc:
         print(f"create_product failed: {exc}")
         return _response(500, {"error": "Unable to save product"})
@@ -68,8 +92,7 @@ def create_product(event, context):
 
 def list_products(event, context):
     try:
-        rows = PRODUCTS().scan().get("Items", [])
-        return _response(200, rows)
+        return _response(200, _scan_all(PRODUCTS()))
     except Exception as exc:
         print(f"list_products failed: {exc}")
         return _response(500, {"error": "Unable to list products"})
@@ -119,9 +142,11 @@ def check_prices(event, context):
     # Accept either a scheduled invocation (scan active catalog) or a direct test event.
     if event.get("productId"):
         product = PRODUCTS().get_item(Key={"productId": event["productId"]}).get("Item")
-        products = [product] if product else []
+        if not product:
+            return {"checked": 0, "observed": 0, "failedProductIds": [], "message": "product not found"}
+        products = [product]
     else:
-        products = PRODUCTS().scan(FilterExpression=Attr("active").eq(True)).get("Items", [])
+        products = _scan_all(PRODUCTS(), FilterExpression=Attr("active").eq(True))
     checked_at = datetime.now(timezone.utc).isoformat()
     observed = 0
     failures = []
@@ -132,10 +157,13 @@ def check_prices(event, context):
                 continue
             detail = {"productId": product["productId"], "checkedAt": checked_at, **result}
             PRICES().put_item(Item={**detail, "expiresAt": int((datetime.now(timezone.utc) + timedelta(days=30)).timestamp())})
-            events.put_events(Entries=[{"Source": "pricing.competitor", "DetailType": "CompetitorPriceObserved",
-                                        "Detail": json.dumps(detail, default=str), "EventBusName": "default"}])
+            publish_result = events.put_events(Entries=[{"Source": "pricing.competitor", "DetailType": "CompetitorPriceObserved",
+                                                         "Detail": json.dumps(detail, default=str), "EventBusName": "default"}])
+            if publish_result.get("FailedEntryCount", 0):
+                entry_error = publish_result.get("Entries", [{}])[0]
+                raise RuntimeError(f"Unable to publish price event: {entry_error.get('ErrorMessage', 'unknown EventBridge error')}")
             observed += 1
-        except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError) as exc:
+        except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError, TypeError) as exc:
             print(f"price check failed for {product.get('productId')}: {exc}")
             failures.append(product.get("productId"))
     return {"checked": len(products), "observed": observed, "failedProductIds": failures}
