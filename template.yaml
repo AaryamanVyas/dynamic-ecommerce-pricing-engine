@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Dynamic competitor pricing demo (alerts only; no automatic store repricing).
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 20
+    MemorySize: 256
+    Environment:
+      Variables:
+        PRODUCTS_TABLE: !Ref ProductsTable
+        PRICES_TABLE: !Ref PricesTable
+        VENDOR_EMAIL: !Ref VendorEmail
+        EBAY_CLIENT_ID: !Ref EbayClientId
+        EBAY_CLIENT_SECRET: !Ref EbayClientSecret
+        USE_MOCK_PRICES: !Ref UseMockPrices
+
+Parameters:
+  VendorEmail:
+    Type: String
+    Description: Verified SES recipient for the demo alert.
+  EbayClientId:
+    Type: String
+    NoEcho: true
+    Default: ''
+  EbayClientSecret:
+    Type: String
+    NoEcho: true
+    Default: ''
+  UseMockPrices:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+
+Resources:
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+
+  PricesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+        - AttributeName: checkedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+        - AttributeName: checkedAt
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: v1
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'content-type'"
+        AllowOrigin: "'*'"
+
+  CreateProductFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.create_product
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref ProductsTable
+      Events:
+        CreateProduct:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /products
+            Method: post
+
+  ListProductsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.list_products
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ProductsTable
+      Events:
+        ListProducts:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /products
+            Method: get
+
+  PriceCheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.check_prices
+      Timeout: 60
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ProductsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref PricesTable
+        - EventBridgePutEventsPolicy:
+            EventBusName: default
+      Events:
+        HourlyCheck:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Enabled: true
+
+  EvaluatePriceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.evaluate_price
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ProductsTable
+        - SESCrudPolicy:
+            IdentityName: '*'
+      Events:
+        CompetitorPriceEvent:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [pricing.competitor]
+              detail-type: [CompetitorPriceObserved]
+
+Outputs:
+  ApiUrl:
+    Description: Product API base URL
+    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/v1'
+  ProductsTableName:
+    Value: !Ref ProductsTable
+  PricesTableName:
+    Value: !Ref PricesTable

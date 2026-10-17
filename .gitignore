@@ -1,0 +1,16 @@
+# AWS SAM build output and local deployment settings
+.aws-sam/
+samconfig.toml
+
+# Python artifacts and local virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key

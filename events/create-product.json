@@ -1,0 +1,3 @@
+{
+  "body": "{\"productId\":\"demo-001\",\"name\":\"Wireless Mouse\",\"searchQuery\":\"wireless mouse\",\"marketplace\":\"EBAY_US\",\"currency\":\"USD\",\"currentPrice\":29.99,\"minimumPrice\":24.99,\"undercutPercent\":5,\"vendorEmail\":\"verified-recipient@example.com\",\"active\":true}"
+}
