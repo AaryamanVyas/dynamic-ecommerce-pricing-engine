@@ -1,0 +1,2 @@
+-r requirements-tools.txt
+moto[dynamodb,events,ses,sqs]>=5.2,<6

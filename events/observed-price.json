@@ -7,6 +7,8 @@
     "competitorPrice": "26.99",
     "shipping": "0",
     "currency": "USD",
-    "itemUrl": "https://www.ebay.com/itm/example"
+    "source": "mock",
+    "itemUrl": "",
+    "title": "Simulated competitor listing"
   }
 }

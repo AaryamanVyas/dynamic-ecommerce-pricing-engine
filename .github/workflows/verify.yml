@@ -1,0 +1,26 @@
+name: Verify pricing microservice
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: 'true'
+      SAM_CLI_TELEMETRY: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m unittest discover -s tests -v
+      - run: ./tests/test_deploy_environment.ps1
+        shell: pwsh
+      - uses: aws-actions/setup-sam@v2
+        with:
+          version: '1.169.0'
+      - run: sam validate --lint
+      - run: sam build

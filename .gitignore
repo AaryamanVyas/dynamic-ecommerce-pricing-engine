@@ -14,3 +14,7 @@ venv/
 !.env.example
 *.pem
 *.key
+
+# Local credentials, reports, and scratch files
+.local/
+work/

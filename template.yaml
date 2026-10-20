@@ -1,6 +1,40 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Dynamic competitor pricing demo (alerts only; no automatic store repricing).
+Description: Authenticated competitor pricing microservice; vendor alerts, no automatic repricing.
+
+Parameters:
+  VendorEmail:
+    Type: String
+    Description: SES verified sender address (verify the demo recipient in the same region).
+    AllowedPattern: '[^\s@]+@[^\s@]+\.[^\s@]+'
+  UseMockPrices:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+  EbaySecretArn:
+    Type: String
+    Default: ''
+    Description: Optional Secrets Manager ARN containing clientId and clientSecret. Required for live prices.
+  EnableSchedule:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+  AlertCooldownSeconds:
+    Type: Number
+    Default: 86400
+    MinValue: 60
+
+Conditions:
+  HasEbaySecret: !Not [!Equals [!Ref EbaySecretArn, '']]
+  ScheduleEnabled: !Equals [!Ref EnableSchedule, 'true']
+  LiveMode: !Equals [!Ref UseMockPrices, 'false']
+
+Rules:
+  LiveModeNeedsCredentials:
+    RuleCondition: !Equals [!Ref UseMockPrices, 'false']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref EbaySecretArn, '']]
+        AssertDescription: Live mode requires an eBay Secrets Manager ARN; mock fallback is never automatic.
 
 Globals:
   Function:
@@ -11,27 +45,6 @@ Globals:
       Variables:
         PRODUCTS_TABLE: !Ref ProductsTable
         PRICES_TABLE: !Ref PricesTable
-        VENDOR_EMAIL: !Ref VendorEmail
-        EBAY_CLIENT_ID: !Ref EbayClientId
-        EBAY_CLIENT_SECRET: !Ref EbayClientSecret
-        USE_MOCK_PRICES: !Ref UseMockPrices
-
-Parameters:
-  VendorEmail:
-    Type: String
-    Description: Verified SES recipient for the demo alert.
-  EbayClientId:
-    Type: String
-    NoEcho: true
-    Default: ''
-  EbayClientSecret:
-    Type: String
-    NoEcho: true
-    Default: ''
-  UseMockPrices:
-    Type: String
-    AllowedValues: ['true', 'false']
-    Default: 'true'
 
 Resources:
   ProductsTable:
@@ -63,30 +76,110 @@ Resources:
         AttributeName: expiresAt
         Enabled: true
 
+  PriceEvents:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${AWS::StackName}-prices'
+
+  FailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  FailureQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref FailureQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt FailureQueue.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Effect: Deny
+            Principal: '*'
+            Action: 'sqs:*'
+            Resource: !GetAtt FailureQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
   Api:
-    Type: AWS::Serverless::Api
+    Type: AWS::Serverless::HttpApi
     Properties:
       StageName: v1
-      Cors:
-        AllowMethods: "'GET,POST,OPTIONS'"
-        AllowHeaders: "'content-type'"
-        AllowOrigin: "'*'"
+      Auth:
+        EnableIamAuthorizer: true
+        DefaultAuthorizer: AWS_IAM
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 5
+        ThrottlingRateLimit: 2
+
+  ApiEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PublishPriceCheck
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt PriceEvents.Arn
+
+  CheckIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationSubtype: EventBridge-PutEvents
+      PayloadFormatVersion: '1.0'
+      CredentialsArn: !GetAtt ApiEventRole.Arn
+      RequestParameters:
+        EventBusName: !Ref PriceEvents
+        Source: pricing.api
+        DetailType: PriceCheckRequested
+        Detail: '$request.body'
+
+  CheckRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: 'POST /checks'
+      AuthorizationType: AWS_IAM
+      Target: !Sub 'integrations/${CheckIntegration}'
 
   CreateProductFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
       Handler: app.create_product
+      Environment:
+        Variables:
+          USE_MOCK_PRICES: !Ref UseMockPrices
       Policies:
         - DynamoDBWritePolicy:
             TableName: !Ref ProductsTable
       Events:
         CreateProduct:
-          Type: Api
+          Type: HttpApi
           Properties:
-            RestApiId: !Ref Api
+            ApiId: !Ref Api
             Path: /products
-            Method: post
+            Method: POST
 
   ListProductsFunction:
     Type: AWS::Serverless::Function
@@ -98,55 +191,186 @@ Resources:
             TableName: !Ref ProductsTable
       Events:
         ListProducts:
-          Type: Api
+          Type: HttpApi
           Properties:
-            RestApiId: !Ref Api
+            ApiId: !Ref Api
             Path: /products
-            Method: get
+            Method: GET
+
+  PriceHistoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.price_history
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ProductsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref PricesTable
+      Events:
+        PriceHistory:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /products/{productId}/prices
+            Method: GET
 
   PriceCheckFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
       Handler: app.check_prices
-      Timeout: 60
+      Timeout: 120
+      Environment:
+        Variables:
+          USE_MOCK_PRICES: !Ref UseMockPrices
+          EVENT_BUS_NAME: !Ref PriceEvents
+          EBAY_SECRET_ARN: !Ref EbaySecretArn
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 3600
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt FailureQueue.Arn
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref ProductsTable
         - DynamoDBWritePolicy:
             TableName: !Ref PricesTable
         - EventBridgePutEventsPolicy:
-            EventBusName: default
+            EventBusName: !Ref PriceEvents
       Events:
+        RequestedCheck:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref PriceEvents
+            Pattern:
+              source: [pricing.api]
+              detail-type: [PriceCheckRequested]
+            DeadLetterConfig:
+              Arn: !GetAtt FailureQueue.Arn
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 3600
         HourlyCheck:
           Type: Schedule
           Properties:
             Schedule: rate(1 hour)
-            Enabled: true
+            State: !If [ScheduleEnabled, ENABLED, DISABLED]
+            DeadLetterConfig:
+              Arn: !GetAtt FailureQueue.Arn
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 3600
+
+  EbaySecretAccess:
+    Type: AWS::IAM::Policy
+    Condition: HasEbaySecret
+    Properties:
+      PolicyName: ReadEbayCredentials
+      Roles: [!Ref PriceCheckFunctionRole]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref EbaySecretArn
 
   EvaluatePriceFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
       Handler: app.evaluate_price
+      Environment:
+        Variables:
+          VENDOR_EMAIL: !Ref VendorEmail
+          ALERT_COOLDOWN_SECONDS: !Ref AlertCooldownSeconds
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 3600
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt FailureQueue.Arn
       Policies:
-        - DynamoDBReadPolicy:
+        - DynamoDBCrudPolicy:
             TableName: !Ref ProductsTable
-        - SESCrudPolicy:
-            IdentityName: '*'
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${VendorEmail}'
+              Condition:
+                StringEquals:
+                  ses:FromAddress: !Ref VendorEmail
       Events:
         CompetitorPriceEvent:
           Type: EventBridgeRule
           Properties:
+            EventBusName: !Ref PriceEvents
             Pattern:
               source: [pricing.competitor]
               detail-type: [CompetitorPriceObserved]
+            DeadLetterConfig:
+              Arn: !GetAtt FailureQueue.Arn
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 3600
+
+  CreateProductLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CreateProductFunction}'
+      RetentionInDays: 14
+  ListProductsLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ListProductsFunction}'
+      RetentionInDays: 14
+  PriceHistoryLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PriceHistoryFunction}'
+      RetentionInDays: 14
+  PriceCheckLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PriceCheckFunction}'
+      RetentionInDays: 14
+  EvaluatePriceLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EvaluatePriceFunction}'
+      RetentionInDays: 14
+
+  FailureQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Failed pricing events need inspection in the failure queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt FailureQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
 
 Outputs:
   ApiUrl:
-    Description: Product API base URL
-    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/v1'
+    Description: IAM-authenticated HTTP API; sign requests with AWS Signature V4.
+    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/v1'
   ProductsTableName:
     Value: !Ref ProductsTable
   PricesTableName:
     Value: !Ref PricesTable
+  EventBusName:
+    Value: !Ref PriceEvents
+  FailureQueueUrl:
+    Value: !Ref FailureQueue
+  PriceMode:
+    Value: !If [LiveMode, ebay, mock]
